@@ -176,6 +176,8 @@ struct Query {
     path: Option<String>,
     /// The branch of the repository to fetch contents from.
     branch: Option<String>,
+    /// The GitHub token to use for API requests.
+    github_token: Option<String>,
     /// The patterns to ignore from repository analysis.
     ignore_patterns: Vec<String>,
     /// The patterns to exclude from repository analysis.
@@ -241,6 +243,7 @@ impl Query {
             repo_name,
             path,
             branch,
+            github_token: None,
             ignore_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
             include_patterns: Vec::new(),
@@ -431,7 +434,7 @@ impl Query {
     ) -> Result<(), GitHubApiError> {
         if node.r#type == "file" && !node.ignore_content {
             if let Some(download_url) = &node.download_url {
-                if let Ok(content) = fetch_file_content(download_url).await {
+                if let Ok(content) = self.fetch_file_content(download_url).await {
                     files.push(FileContent {
                         path: node.path.clone(),
                         content,
@@ -465,7 +468,7 @@ impl Query {
         if let Ok(ignore_content) = gitignore_result {
             if let Some(download_url) = ignore_content.first().and_then(|c| c.download_url.as_ref())
             {
-                if let Ok(gitignore) = fetch_file_content(download_url).await {
+                if let Ok(gitignore) = self.fetch_file_content(download_url).await {
                     let patterns = gitignore
                         .lines()
                         .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
@@ -474,6 +477,44 @@ impl Query {
                 }
             }
         }
+    }
+
+    /// Fetches the content of a file from a given URL.
+    ///
+    /// # Arguments
+    /// * `url` - The URL to fetch the file content from
+    /// * `rate_limit` - Optional rate limit tracking for GitHub API requests
+    ///
+    /// # Returns
+    /// * `Ok(String)` - The content of the file as a UTF-8 string
+    /// * `Err(GitHubApiError)` - Error if the fetch fails or rate limit is exceeded
+    async fn fetch_file_content(&self, url: &str) -> Result<String, GitHubApiError> {
+        let mut headers = vec![];
+        headers.push((
+            "User-Agent".to_string(),
+            "X-GitHub-Api-Version: 2022-11-28".to_string(),
+        ));
+        headers.push((
+            "Accept".to_string(),
+            "application/vnd.github.raw".to_string(),
+        ));
+        if let Some(github_token) = &self.github_token {
+            headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", github_token),
+            ));
+        }
+        let request = HttpRequestBuilder::new()
+            .headers(headers)
+            .method(HttpMethod::Get)
+            .url(url)
+            .build()
+            .map_err(|e| GitHubApiError::Network(e.to_string()));
+
+        let resp =
+            http_client::fetch(&request?).map_err(|e| GitHubApiError::Network(e.to_string()))?;
+
+        String::from_utf8(resp.body).map_err(|e| GitHubApiError::Other(e.to_string()))
     }
 
     /// Processes a file node in the repository tree.
@@ -594,9 +635,25 @@ impl Query {
             self.api_url("")
         };
 
+        let mut headers = vec![];
+        headers.push((
+            "User-Agent".to_string(),
+            "X-GitHub-Api-Version: 2022-11-28".to_string(),
+        ));
+        headers.push((
+            "Accept".to_string(),
+            "application/vnd.github+json".to_string(),
+        ));
+
+        if let Some(github_token) = &self.github_token {
+            headers.push((
+                "Authorization".to_string(),
+                format!("Bearer {}", github_token),
+            ));
+        }
+
         let request = HttpRequestBuilder::new()
-            .header("User-Agent", "X-GitHub-Api-Version: 2022-11-28")
-            .header("Accept", "application/vnd.github+json")
+            .headers(headers)
             .method(HttpMethod::Get)
             .url(&url)
             .build()
@@ -666,29 +723,6 @@ struct Stats {
     total_size: u64,
 }
 
-/// Fetches the content of a file from a given URL.
-///
-/// # Arguments
-/// * `url` - The URL to fetch the file content from
-/// * `rate_limit` - Optional rate limit tracking for GitHub API requests
-///
-/// # Returns
-/// * `Ok(String)` - The content of the file as a UTF-8 string
-/// * `Err(GitHubApiError)` - Error if the fetch fails or rate limit is exceeded
-async fn fetch_file_content(url: &str) -> Result<String, GitHubApiError> {
-    let request = HttpRequestBuilder::new()
-        .header("User-Agent", "X-GitHub-Api-Version: 2022-11-28")
-        .header("Accept", "application/vnd.github.raw")
-        .method(HttpMethod::Get)
-        .url(url)
-        .build()
-        .map_err(|e| GitHubApiError::Network(e.to_string()));
-
-    let resp = http_client::fetch(&request?).map_err(|e| GitHubApiError::Network(e.to_string()))?;
-
-    String::from_utf8(resp.body).map_err(|e| GitHubApiError::Other(e.to_string()))
-}
-
 /// Represents the GitIngest extension that analyzes GitHub repositories.
 #[derive(Default)]
 struct GitIngestExtension;
@@ -739,6 +773,9 @@ impl Extension for GitIngestExtension {
                             .split(',')
                             .map(|s| s.trim().to_string())
                             .for_each(|s| include_patterns.push(s));
+                    } else if arg.starts_with("github_token:") {
+                        let token = arg.trim_start_matches("github_token:").trim().to_string();
+                        query.github_token = Some(token);
                     }
                 }
 
@@ -838,6 +875,7 @@ mod tests {
             repo_name: String::from("test_repo"),
             path: None,
             branch: None,
+            github_token: None,
             ignore_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
             include_patterns: Vec::new(),
@@ -874,6 +912,7 @@ mod tests {
             repo_name: String::from("test_repo"),
             path: None,
             branch: None,
+            github_token: None,
             ignore_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
             include_patterns: Vec::new(),
@@ -988,6 +1027,7 @@ mod tests {
             repo_name: "test-repo".to_string(),
             path: Some("src".to_string()),
             branch: Some("main".to_string()),
+            github_token: None,
             ignore_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
             include_patterns: Vec::new(),
@@ -1037,6 +1077,7 @@ mod tests {
             repo_name: String::from("test_repo"),
             path: None,
             branch: None,
+            github_token: None,
             ignore_patterns: Vec::new(),
             exclude_patterns: vec!["test/*.log".to_string()],
             include_patterns: vec!["**/*.rs".to_string()],
@@ -1107,6 +1148,7 @@ mod tests {
             repo_name: String::from("test_repo"),
             path: None,
             branch: None,
+            github_token: None,
             ignore_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
             include_patterns: Vec::new(),
