@@ -42,9 +42,19 @@ Follow these simple steps to set up the Git Ingest Extension in Zed Editor.
 ## Usage
 
 Use the `/gitingest` command followed by a GitHub repository URL and optional include/exclude patterns:
-
+Basic usage with just the URL:
 ```bash
-/gitingest https://github.com/username/repo include:pattern1i,pattern2i exclude:pattern1e,pattern2e
+/gitingest https://github.com/username/repo
+```
+
+Add include/exclude patterns to filter files:
+```bash 
+/gitingest https://github.com/username/repo include:*.rs,src/*.ts exclude:*.log,test/*
+```
+
+For private repos or higher rate limits, add GitHub token:
+```bash
+/gitingest https://github.com/username/repo github_token:your_token
 ```
 
 The extension supports:
@@ -65,6 +75,10 @@ Pattern behavior:
 - Files matching exclude patterns are always excluded
 - Include/exclude patterns are checked against full file paths
 - Patterns are cumulative with .gitignore rules
+
+Additional options:
+- GitHub Token: `github_token:your_token` - Optional personal access token for authenticated requests
+- GitHub token enables higher API rate limits and access to private repositories
 
 ## Output
 
