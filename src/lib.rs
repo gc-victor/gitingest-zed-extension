@@ -313,10 +313,6 @@ impl Query {
 
         // Process all contents
         for content in contents {
-            if !self.should_include(&content.path) || self.should_exclude(&content.path) {
-                continue;
-            }
-
             match content.content_type.as_str() {
                 "file" => {
                     if let Some(value) = self.process_file(&mut stats, &mut root_node, &content) {
@@ -375,7 +371,7 @@ impl Query {
 
         let path = self.path.as_deref().unwrap_or("");
         let api_url = self.api_url(path);
-        summary.push_str("API URL:\n");
+        summary.push_str("API URL: ");
         summary.push_str(&format!("{}\n\n", api_url));
 
         summary.push_str("Directory structure:\n");
@@ -533,6 +529,10 @@ impl Query {
         root_node: &mut Node,
         content: &GitHubContent,
     ) -> Option<Result<String, GitIngestError>> {
+        if !self.should_include(&content.path) || self.should_exclude(&content.path) {
+            return None;
+        }
+
         stats.total_files += 1;
         let size = content.size.unwrap_or(0);
         stats.total_size += size;
@@ -680,9 +680,14 @@ impl Query {
         if self.include_patterns.is_empty() {
             return true;
         }
-        self.include_patterns
-            .iter()
-            .any(|pattern| glob::Pattern::new(pattern).map_or(false, |p| p.matches(path)))
+
+        let mut patterns: Box<dyn Iterator<Item = &String>> = if is_file(path) {
+            Box::new(self.include_patterns.iter().filter(|p| is_file(&p)))
+        } else {
+            Box::new(self.include_patterns.iter().filter(|p| !is_file(p)))
+        };
+
+        patterns.any(|pattern| glob::Pattern::new(pattern).map_or(false, |p| p.matches(path)))
     }
 
     /// Helper function to check if file path matches exclude or ignore patterns.
@@ -694,14 +699,22 @@ impl Query {
     /// * `true` if path matches exclude patterns or ignore patterns
     /// * `false` if path does not match any exclude or ignore patterns
     fn should_exclude(&self, path: &str) -> bool {
-        self.exclude_patterns
-            .iter()
-            .any(|pattern| glob::Pattern::new(pattern).map_or(false, |p| p.matches(path)))
+        let mut patterns: Box<dyn Iterator<Item = &String>> = if is_file(path) {
+            Box::new(self.exclude_patterns.iter().filter(|p| is_file(p)))
+        } else {
+            Box::new(self.exclude_patterns.iter().filter(|p| !is_file(p)))
+        };
+
+        patterns.any(|pattern| glob::Pattern::new(pattern).map_or(false, |p| p.matches(path)))
             || self
                 .ignore_patterns
                 .iter()
                 .any(|p| path.contains(p.as_str()))
     }
+}
+
+fn is_file(path: &str) -> bool {
+    path.split('/').last().map_or(false, |s| s.contains('.'))
 }
 
 /// Represents the content of a file in the repository.
