@@ -5,6 +5,9 @@ use zed_extension_api::{
     Extension, SlashCommand, SlashCommandOutput, SlashCommandOutputSection, Worktree,
 };
 
+/// Maximum total size of all files allowed (1 MB).
+const MAX_TOTAL_FILES_SIZE: u64 = 1 * 1024 * 1024;
+
 /// Maximum file size allowed (50 KB).
 const MAX_FILE_SIZE: u64 = 50 * 1024;
 
@@ -114,8 +117,10 @@ impl std::fmt::Display for GitHubApiError {
 /// Represents errors that can occur during the Git ingestion process.
 #[derive(Debug)]
 enum GitIngestError {
+    /// Error indicating that the maximum allowed number of files has been exceeded.
+    MaxFilesExceeded(usize),
     /// Error indicating that the maximum allowed size has been exceeded.
-    MaxSizeExceeded(u64),
+    MaxTotalFilesSizeExceeded(u64),
     /// Error indicating that the repository was not found.
     RepoNotFound(String),
     /// Error indicating that the provided URL is invalid.
@@ -127,7 +132,10 @@ impl std::error::Error for GitIngestError {}
 impl std::fmt::Display for GitIngestError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Self::MaxSizeExceeded(size) => write!(f, "Max size exceeded: {} bytes", size),
+            Self::MaxFilesExceeded(count) => write!(f, "Max files exceeded: {}", count),
+            Self::MaxTotalFilesSizeExceeded(size) => {
+                write!(f, "Max total files size exceeded: {} bytes", size)
+            }
             Self::RepoNotFound(msg) => write!(f, "Repository not found: {}", msg),
             Self::InvalidUrl(url) => write!(f, "Invalid URL: {}", url),
         }
@@ -487,9 +495,21 @@ impl Query {
         stats.total_files += 1;
         let size = content.size.unwrap_or(0);
         stats.total_size += size;
-        if stats.total_files > MAX_FILES {
-            return Some(Err(GitIngestError::MaxSizeExceeded(stats.total_size)));
+
+        if size > MAX_FILE_SIZE {
+            return None;
         }
+
+        if stats.total_files > MAX_FILES {
+            return Some(Err(GitIngestError::MaxFilesExceeded(stats.total_files)));
+        }
+
+        if stats.total_size > MAX_TOTAL_FILES_SIZE {
+            return Some(Err(GitIngestError::MaxTotalFilesSizeExceeded(
+                stats.total_size,
+            )));
+        }
+
         root_node.children.push(Node {
             name: content.name.clone(),
             r#type: "file".to_string(),
@@ -915,11 +935,16 @@ mod tests {
 
     #[test]
     fn test_git_ingest_error_display() {
-        let max_size = GitIngestError::MaxSizeExceeded(1000);
+        let max_files = GitIngestError::MaxFilesExceeded(100);
+        let max_size = GitIngestError::MaxTotalFilesSizeExceeded(1000);
         let not_found = GitIngestError::RepoNotFound("repo missing".to_string());
         let invalid_url = GitIngestError::InvalidUrl("bad url".to_string());
 
-        assert_eq!(max_size.to_string(), "Max size exceeded: 1000 bytes");
+        assert_eq!(max_files.to_string(), "Max files exceeded: 100");
+        assert_eq!(
+            max_size.to_string(),
+            "Max total files size exceeded: 1000 bytes"
+        );
         assert_eq!(not_found.to_string(), "Repository not found: repo missing");
         assert_eq!(invalid_url.to_string(), "Invalid URL: bad url");
     }
