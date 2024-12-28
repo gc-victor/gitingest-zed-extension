@@ -1,5 +1,3 @@
-use std::collections::HashSet;
-
 use serde::Deserialize;
 use zed_extension_api::{
     self as zed,
@@ -98,8 +96,6 @@ type GitHubContents = Vec<GitHubContent>;
 #[derive(Debug)]
 /// Represents errors that can occur when interacting with the GitHub API.
 enum GitHubApiError {
-    /// Error indicating that the rate limit has been exceeded.
-    RateLimit(String),
     /// Error indicating a network-related issue.
     Network(String),
     /// Error indicating an unspecified issue.
@@ -109,35 +105,8 @@ enum GitHubApiError {
 impl std::fmt::Display for GitHubApiError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::RateLimit(msg) => write!(f, "Rate limit exceeded: {}", msg),
             Self::Network(msg) => write!(f, "Network error: {}", msg),
             Self::Other(msg) => write!(f, "Error: {}", msg),
-        }
-    }
-}
-
-/// Represents the rate limit information.
-#[derive(Debug, Clone)]
-/// Represents the rate limit information for GitHub API requests.
-struct RateLimit {
-    /// The number of remaining requests allowed before hitting the rate limit.
-    remaining: u32,
-    /// The time at which the rate limit will reset.
-    reset_time: std::time::Instant,
-}
-
-impl RateLimit {
-    /// Checks if the rate limit has been reached.
-    fn is_limited(&self) -> bool {
-        self.remaining == 0 && std::time::Instant::now() < self.reset_time
-    }
-
-    /// Returns the duration until the rate limit resets.
-    fn time_to_reset(&self) -> std::time::Duration {
-        if self.reset_time <= std::time::Instant::now() {
-            std::time::Duration::from_secs(0)
-        } else {
-            self.reset_time - std::time::Instant::now()
         }
     }
 }
@@ -199,6 +168,8 @@ struct Query {
     path: Option<String>,
     /// The branch of the repository to fetch contents from.
     branch: Option<String>,
+    /// The patterns to ignore from repository analysis.
+    ignore_patterns: Vec<String>,
     /// The patterns to exclude from repository analysis.
     exclude_patterns: Vec<String>,
     /// The patterns to include in repository analysis.
@@ -262,6 +233,7 @@ impl Query {
             repo_name,
             path,
             branch,
+            ignore_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
             include_patterns: Vec::new(),
         })
@@ -277,13 +249,13 @@ impl Query {
     ///
     /// # Returns
     /// A String containing the complete GitHub API URL for fetching contents
-    fn api_url(&self) -> String {
+    fn api_url(&self, path: &str) -> String {
         let mut url = format!(
             "https://api.github.com/repos/{}/{}/contents",
             self.user_name, self.repo_name
         );
 
-        if let Some(ref path) = self.path {
+        if !path.is_empty() {
             url.push_str(&format!("/{}", path));
         }
 
@@ -292,6 +264,298 @@ impl Query {
         }
 
         url
+    }
+
+    /// Processes the repository and returns a summary string.
+    ///
+    /// # Returns
+    /// * `Ok(String)` - Summary string of repository analysis
+    /// * `Err(GitIngestError)` - Error if processing fails
+    async fn process_repo(&mut self) -> Result<String, GitIngestError> {
+        let mut stats = Stats {
+            total_files: 0,
+            total_size: 0,
+        };
+
+        // Fetch initial repository contents
+        let contents = self
+            .fetch_contents(self.path.as_deref().unwrap_or(""))
+            .await
+            .map_err(|e| GitIngestError::RepoNotFound(e.to_string()))?;
+
+        // Create root node
+        let mut root_node = Node {
+            name: self.repo_name.clone(),
+            r#type: "directory".to_string(),
+            size: 0,
+            children: vec![],
+            file_count: 0,
+            dir_count: 1,
+            path: String::new(),
+            ignore_content: false,
+            download_url: None,
+        };
+
+        if !self.ignore_patterns.is_empty() {
+            self.set_ignore_patterns().await;
+        }
+
+        // Process all contents
+        for content in contents {
+            if !self.should_include(&content.path) || self.should_exclude(&content.path) {
+                continue;
+            }
+
+            match content.content_type.as_str() {
+                "file" => {
+                    if let Some(value) = self.process_file(&mut stats, &mut root_node, &content) {
+                        return value;
+                    }
+                }
+                "dir" => {
+                    if let Some(value) = self
+                        .process_directory(&mut stats, &mut root_node, content)
+                        .await
+                    {
+                        return value;
+                    }
+                }
+                _ => continue,
+            }
+        }
+
+        root_node.file_count = stats.total_files;
+        root_node.dir_count = root_node
+            .children
+            .iter()
+            .filter(|n| n.r#type == "directory")
+            .count();
+        root_node.size = stats.total_size;
+
+        let mut files = Vec::new();
+        match self.extract_files_content(&root_node, &mut files).await {
+            Ok(_) => {}
+            Err(e) => return Err(GitIngestError::RepoNotFound(e.to_string())),
+        };
+
+        Ok(self.create_summary_string(&root_node, &files))
+    }
+
+    /// Creates a summary string for the repository.
+    ///
+    /// # Arguments
+    /// * `nodes` - Root node containing repository tree structure
+    /// * `files` - List of file contents to include in summary
+    ///
+    /// # Returns
+    /// A formatted string containing repository summary with directory structure and file contents
+    fn create_summary_string(&self, nodes: &Node, files: &[FileContent]) -> String {
+        let mut summary = String::new();
+        summary.push_str(&format!(
+            "Repository: {}/{}\n",
+            self.user_name, self.repo_name
+        ));
+        summary.push_str(&format!("Total files: {}\n", nodes.file_count));
+        summary.push_str(&format!(
+            "Total size: {:.2} KB\n",
+            nodes.size as f64 / 1024.0
+        ));
+        summary.push_str(&format!("Directory count: {}\n\n", nodes.dir_count));
+
+        let path = self.path.as_deref().unwrap_or("");
+        let api_url = self.api_url(path);
+        summary.push_str("API URL:\n");
+        summary.push_str(&format!("{}\n\n", api_url));
+
+        summary.push_str("Directory structure:\n");
+        summary.push_str(&self.create_tree_structure(nodes, "", true));
+
+        if !files.is_empty() {
+            summary.push_str("\nSelected file contents:\n");
+            for file in files {
+                summary.push_str(&format!("\n--- {} ---\n{}\n", file.path, file.content));
+            }
+        }
+
+        summary
+    }
+
+    /// Creates a tree structure string representation of the repository.
+    ///
+    /// # Arguments
+    /// * `node` - Current node in the repository tree structure
+    /// * `prefix` - String prefix to use for the current node's indentation
+    /// * `is_last` - Whether this node is the last child in its parent's children
+    ///
+    /// # Returns
+    /// A formatted string representing the node and its children in a tree structure
+    fn create_tree_structure(&self, node: &Node, prefix: &str, is_last: bool) -> String {
+        let mut result = String::new();
+        let marker = if is_last { "└── " } else { "├── " };
+
+        result.push_str(&format!("{}{}{}\n", prefix, marker, node.name));
+
+        let child_prefix = if is_last { "    " } else { "│   " };
+        for (i, child) in node.children.iter().enumerate() {
+            result.push_str(&self.create_tree_structure(
+                child,
+                &format!("{}{}", prefix, child_prefix),
+                i == node.children.len() - 1,
+            ));
+        }
+
+        result
+    }
+
+    /// Extracts the content of files from the repository.
+    ///
+    /// # Arguments
+    /// * `node` - Current node in the repository tree structure
+    /// * `files` - Vector to store extracted file contents
+    ///
+    /// # Returns
+    /// * `Ok(())` - Successfully extracted file contents
+    /// * `Err(GitHubApiError)` - Error if content extraction fails
+    async fn extract_files_content(
+        &self,
+        node: &Node,
+        files: &mut Vec<FileContent>,
+    ) -> Result<(), GitHubApiError> {
+        if node.r#type == "file" && !node.ignore_content {
+            if let Some(download_url) = &node.download_url {
+                if let Ok(content) = fetch_file_content(download_url).await {
+                    files.push(FileContent {
+                        path: node.path.clone(),
+                        content,
+                    });
+                }
+            }
+        }
+
+        for child in &node.children {
+            Box::pin(self.extract_files_content(child, files)).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Sets ignore patterns for the repository processing.
+    ///
+    /// This method initializes the ignore patterns with default patterns and
+    /// optionally incorporates patterns from repository's .gitignore file if present.
+    ///
+    /// # Returns
+    /// None, but updates the ignore_patterns vector with default patterns and
+    /// any additional patterns found in .gitignore.
+    async fn set_ignore_patterns(&mut self) {
+        self.ignore_patterns = DEFAULT_IGNORE_PATTERNS
+            .iter()
+            .map(|&s| s.to_string())
+            .collect();
+
+        let gitignore_result = self.fetch_contents(".gitignore").await;
+        if let Ok(ignore_content) = gitignore_result {
+            if let Some(download_url) = ignore_content.first().and_then(|c| c.download_url.as_ref())
+            {
+                if let Ok(gitignore) = fetch_file_content(download_url).await {
+                    let patterns = gitignore
+                        .lines()
+                        .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
+                        .map(ToString::to_string);
+                    self.ignore_patterns.extend(patterns);
+                }
+            }
+        }
+    }
+
+    /// Processes a file node in the repository tree.
+    ///
+    /// # Arguments
+    /// * `stats` - Statistics tracking struct for the repository
+    /// * `root_node` - Parent node to attach file node to
+    /// * `content` - GitHub content information for the file
+    ///
+    /// # Returns
+    /// * `Some(Result<String, GitIngestError>)` if an error occurred
+    /// * `None` if processing completed successfully
+    fn process_file(
+        &self,
+        stats: &mut Stats,
+        root_node: &mut Node,
+        content: &GitHubContent,
+    ) -> Option<Result<String, GitIngestError>> {
+        stats.total_files += 1;
+        let size = content.size.unwrap_or(0);
+        stats.total_size += size;
+        if stats.total_files > MAX_FILES {
+            return Some(Err(GitIngestError::MaxSizeExceeded(stats.total_size)));
+        }
+        root_node.children.push(Node {
+            name: content.name.clone(),
+            r#type: "file".to_string(),
+            size,
+            children: vec![],
+            file_count: 1,
+            dir_count: 0,
+            path: content.path.clone(),
+            ignore_content: size > MAX_FILE_SIZE,
+            download_url: content.download_url.clone(),
+        });
+
+        None
+    }
+
+    /// Processes a directory node in the repository tree.
+    ///
+    /// # Arguments
+    /// * `stats` - Statistics tracking struct for the repository
+    /// * `root_node` - Parent node to attach directory node to
+    /// * `content` - GitHub content information for the directory
+    ///
+    /// # Returns
+    /// * `Some(Result<String, GitIngestError>)` if an error occurred
+    /// * `None` if processing completed successfully
+    async fn process_directory(
+        &self,
+        stats: &mut Stats,
+        root_node: &mut Node,
+        content: GitHubContent,
+    ) -> Option<Result<String, GitIngestError>> {
+        if let Ok(dir_contents) = self.fetch_contents(&content.path).await {
+            let mut dir_node = Node {
+                name: content.name,
+                r#type: "directory".to_string(),
+                size: 0,
+                children: vec![],
+                file_count: 0,
+                dir_count: 1,
+                path: content.path,
+                ignore_content: false,
+                download_url: content.download_url.clone(),
+            };
+
+            // Process directory contents
+            for item in dir_contents {
+                if !self.should_include(&item.path) || self.should_exclude(&item.path) {
+                    continue;
+                }
+
+                if item.content_type == "file" {
+                    if let Some(value) = self.process_file(stats, &mut dir_node, &item) {
+                        return Some(value);
+                    }
+                } else if item.content_type == "dir" {
+                    if let Some(value) =
+                        Box::pin(self.process_directory(stats, &mut dir_node, item)).await
+                    {
+                        return Some(value);
+                    }
+                }
+            }
+
+            root_node.children.push(dir_node);
+        }
+        None
     }
 
     /// Fetches the contents of the repository.
@@ -303,25 +567,11 @@ impl Query {
     /// # Returns
     /// * `Ok(GitHubContents)` - Repository contents at specified path
     /// * `Err(GitHubApiError)` - Error if fetch fails or rate limit exceeded
-    async fn fetch_contents(
-        &self,
-        path: Option<&str>,
-        rate_limit: &mut Option<RateLimit>,
-    ) -> Result<GitHubContents, GitHubApiError> {
-        if let Some(limit) = rate_limit {
-            if limit.is_limited() {
-                let wait_time = limit.time_to_reset();
-                return Err(GitHubApiError::RateLimit(format!(
-                    "Rate limit will reset in {} seconds",
-                    wait_time.as_secs()
-                )));
-            }
-        }
-
-        let url = if let Some(p) = path {
-            format!("{}/{}", self.api_url(), p)
+    async fn fetch_contents(&self, path: &str) -> Result<GitHubContents, GitHubApiError> {
+        let url = if !path.is_empty() {
+            self.api_url(path)
         } else {
-            self.api_url()
+            self.api_url("")
         };
 
         let request = HttpRequestBuilder::new()
@@ -339,6 +589,41 @@ impl Query {
             serde_json::from_slice(&resp.body).map_err(|e| GitHubApiError::Other(e.to_string()))?;
 
         Ok(content)
+    }
+
+    /// Helper function to check if file path matches include patterns.
+    ///
+    /// # Arguments
+    /// * `path` - Path within repository to check for inclusion
+    ///
+    /// # Returns
+    /// * `true` if path matches include patterns or if no include patterns are set
+    /// * `false` if path does not match any include patterns
+    fn should_include(&self, path: &str) -> bool {
+        if self.include_patterns.is_empty() {
+            return true;
+        }
+        self.include_patterns
+            .iter()
+            .any(|pattern| glob::Pattern::new(pattern).map_or(false, |p| p.matches(path)))
+    }
+
+    /// Helper function to check if file path matches exclude or ignore patterns.
+    ///
+    /// # Arguments
+    /// * `path` - Path within repository to check for exclusion
+    ///
+    /// # Returns
+    /// * `true` if path matches exclude patterns or ignore patterns
+    /// * `false` if path does not match any exclude or ignore patterns
+    fn should_exclude(&self, path: &str) -> bool {
+        self.exclude_patterns
+            .iter()
+            .any(|pattern| glob::Pattern::new(pattern).map_or(false, |p| p.matches(path)))
+            || self
+                .ignore_patterns
+                .iter()
+                .any(|p| path.contains(p.as_str()))
     }
 }
 
@@ -361,70 +646,6 @@ struct Stats {
     total_size: u64,
 }
 
-/// Creates a summary string for the repository.
-///
-/// # Arguments
-/// * `query` - Query containing repository information
-/// * `nodes` - Root node containing repository tree structure
-/// * `files` - List of file contents to include in summary
-///
-/// # Returns
-/// A formatted string containing repository summary with directory structure and file contents
-fn create_summary_string(query: &Query, nodes: &Node, files: &[FileContent]) -> String {
-    let mut summary = String::new();
-    summary.push_str(&format!(
-        "Repository: {}/{}\n",
-        query.user_name, query.repo_name
-    ));
-    summary.push_str(&format!("Total files: {}\n", nodes.file_count));
-    summary.push_str(&format!(
-        "Total size: {:.2} KB\n",
-        nodes.size as f64 / 1024.0
-    ));
-    summary.push_str(&format!("Directory count: {}\n\n", nodes.dir_count));
-
-    summary.push_str("Directory structure:\n");
-    summary.push_str(&create_tree_structure(query, nodes, "", true));
-
-    if !files.is_empty() {
-        summary.push_str("\nSelected file contents:\n");
-        for file in files {
-            summary.push_str(&format!("\n--- {} ---\n{}\n", file.path, file.content));
-        }
-    }
-
-    summary
-}
-
-/// Creates a tree structure string representation of the repository.
-///
-/// # Arguments
-/// * `query` - Query containing repository information
-/// * `node` - Current node in the repository tree structure
-/// * `prefix` - String prefix to use for the current node's indentation
-/// * `is_last` - Whether this node is the last child in its parent's children
-///
-/// # Returns
-/// A formatted string representing the node and its children in a tree structure
-fn create_tree_structure(query: &Query, node: &Node, prefix: &str, is_last: bool) -> String {
-    let mut result = String::new();
-    let marker = if is_last { "└── " } else { "├── " };
-
-    result.push_str(&format!("{}{}{}\n", prefix, marker, node.name));
-
-    let child_prefix = if is_last { "    " } else { "│   " };
-    for (i, child) in node.children.iter().enumerate() {
-        result.push_str(&create_tree_structure(
-            query,
-            child,
-            &format!("{}{}", prefix, child_prefix),
-            i == node.children.len() - 1,
-        ));
-    }
-
-    result
-}
-
 /// Fetches the content of a file from a given URL.
 ///
 /// # Arguments
@@ -434,20 +655,7 @@ fn create_tree_structure(query: &Query, node: &Node, prefix: &str, is_last: bool
 /// # Returns
 /// * `Ok(String)` - The content of the file as a UTF-8 string
 /// * `Err(GitHubApiError)` - Error if the fetch fails or rate limit is exceeded
-async fn fetch_file_content(
-    url: &str,
-    rate_limit: &mut Option<RateLimit>,
-) -> Result<String, GitHubApiError> {
-    if let Some(limit) = rate_limit {
-        if limit.is_limited() {
-            let wait_time = limit.time_to_reset();
-            return Err(GitHubApiError::RateLimit(format!(
-                "Rate limit will reset in {} seconds",
-                wait_time.as_secs()
-            )));
-        }
-    }
-
+async fn fetch_file_content(url: &str) -> Result<String, GitHubApiError> {
     let request = HttpRequestBuilder::new()
         .header("User-Agent", "X-GitHub-Api-Version: 2022-11-28")
         .header("Accept", "application/vnd.github.raw")
@@ -459,228 +667,6 @@ async fn fetch_file_content(
     let resp = http_client::fetch(&request?).map_err(|e| GitHubApiError::Network(e.to_string()))?;
 
     String::from_utf8(resp.body).map_err(|e| GitHubApiError::Other(e.to_string()))
-}
-
-/// Extracts the content of files from the repository.
-///
-/// # Arguments
-/// * `query` - Query containing repository information
-/// * `node` - Current node in the repository tree structure
-/// * `max_file_size` - Maximum allowed file size in bytes
-/// * `rate_limit` - Rate limit tracking for GitHub API requests
-/// * `files` - Vector to store extracted file contents
-///
-/// # Returns
-/// * `Ok(())` - Successfully extracted file contents
-/// * `Err(GitHubApiError)` - Error if content extraction fails
-async fn extract_files_content(
-    query: &Query,
-    node: &Node,
-    max_file_size: u64,
-    rate_limit: &mut Option<RateLimit>,
-    files: &mut Vec<FileContent>,
-) -> Result<(), GitHubApiError> {
-    if node.r#type == "file" && !node.ignore_content {
-        if let Some(download_url) = &node.download_url {
-            if let Ok(content) = fetch_file_content(download_url, rate_limit).await {
-                files.push(FileContent {
-                    path: node.path.clone(),
-                    content,
-                });
-            }
-        }
-    }
-
-    for child in &node.children {
-        Box::pin(extract_files_content(
-            query,
-            child,
-            max_file_size,
-            rate_limit,
-            files,
-        ))
-        .await?;
-    }
-
-    Ok(())
-}
-
-/// Processes the repository and returns a summary string.
-///
-/// # Arguments
-/// * `query` - Query containing repository information
-/// * `rate_limit` - Rate limit tracking for GitHub API requests
-///
-/// # Returns
-/// * `Ok(String)` - Summary string of repository analysis
-/// * `Err(GitIngestError)` - Error if processing fails
-async fn process_repo(
-    query: &Query,
-    rate_limit: &mut Option<RateLimit>,
-) -> Result<String, GitIngestError> {
-    let mut stats = Stats {
-        total_files: 0,
-        total_size: 0,
-    };
-
-    let mut seen_paths = HashSet::new();
-    // Fetch initial repository contents
-    let contents = query
-        .fetch_contents(None, rate_limit)
-        .await
-        .map_err(|e| GitIngestError::RepoNotFound(e.to_string()))?;
-
-    // Create root node
-    let mut root_node = Node {
-        name: query.repo_name.clone(),
-        r#type: "directory".to_string(),
-        size: 0,
-        children: vec![],
-        file_count: 0,
-        dir_count: 1,
-        path: String::new(),
-        ignore_content: false,
-        download_url: None,
-    };
-
-    let mut ignore_patterns: Vec<String> = DEFAULT_IGNORE_PATTERNS
-        .iter()
-        .map(|&s| s.to_string())
-        .collect();
-
-    let gitignore_result = query.fetch_contents(Some(".gitignore"), rate_limit).await;
-    if let Ok(ignore_content) = gitignore_result {
-        if let Some(download_url) = ignore_content.first().and_then(|c| c.download_url.as_ref()) {
-            if let Ok(gitignore) = fetch_file_content(download_url, rate_limit).await {
-                let patterns = gitignore
-                    .lines()
-                    .filter(|l| !l.trim().is_empty() && !l.trim().starts_with('#'))
-                    .map(ToString::to_string);
-                ignore_patterns.extend(patterns);
-            }
-        }
-    }
-
-    // Helper function to check if path matches include patterns
-    let should_include = |path: &str| -> bool {
-        if query.include_patterns.is_empty() {
-            return true;
-        }
-        query.include_patterns.iter().any(|pattern| {
-            glob::Pattern::new(pattern).map_or(false, |p| p.matches(path))
-        })
-    };
-
-    // Helper function to check if path should be excluded
-    let should_exclude = |path: &str| -> bool {
-        query.exclude_patterns.iter().any(|pattern| {
-            glob::Pattern::new(pattern).map_or(false, |p| p.matches(path))
-        }) || ignore_patterns.iter().any(|p| path.contains(p.as_str()))
-    };
-
-    // Process all contents
-    for content in contents {
-        if !seen_paths.insert(content.path.clone()) {
-            continue;
-        }
-
-        if !should_include(&content.path) || should_exclude(&content.path) {
-            continue;
-        }
-
-        match content.content_type.as_str() {
-            "file" => {
-                stats.total_files += 1;
-                let size = content.size.unwrap_or(0);
-                stats.total_size += size;
-
-                if stats.total_files > MAX_FILES {
-                    return Err(GitIngestError::MaxSizeExceeded(stats.total_size));
-                }
-
-                root_node.children.push(Node {
-                    name: content.name,
-                    r#type: "file".to_string(),
-                    size,
-                    children: vec![],
-                    file_count: 1,
-                    dir_count: 0,
-                    path: content.path,
-                    ignore_content: size > MAX_FILE_SIZE,
-                    download_url: content.download_url.clone(),
-                });
-            }
-            "dir" => {
-                // Fetch directory contents
-                if let Ok(dir_contents) = query.fetch_contents(Some(&content.path), rate_limit).await
-                {
-                    let mut dir_node = Node {
-                        name: content.name,
-                        r#type: "directory".to_string(),
-                        size: 0,
-                        children: vec![],
-                        file_count: 0,
-                        dir_count: 1,
-                        path: content.path,
-                        ignore_content: false,
-                        download_url: content.download_url.clone(),
-                    };
-
-                    // Process directory contents
-                    for item in dir_contents {
-                        if !seen_paths.insert(item.path.clone()) {
-                            continue;
-                        }
-
-                        if !should_include(&item.path) || should_exclude(&item.path) {
-                            continue;
-                        }
-
-                        if item.content_type == "file" {
-                            stats.total_files += 1;
-                            let size = item.size.unwrap_or(0);
-                            stats.total_size += size;
-
-                            if stats.total_files > MAX_FILES {
-                                return Err(GitIngestError::MaxSizeExceeded(stats.total_size));
-                            }
-
-                            dir_node.children.push(Node {
-                                name: item.name,
-                                r#type: "file".to_string(),
-                                size,
-                                children: vec![],
-                                file_count: 1,
-                                dir_count: 0,
-                                path: item.path,
-                                ignore_content: size > MAX_FILE_SIZE,
-                                download_url: item.download_url.clone(),
-                            });
-                        }
-                    }
-
-                    root_node.children.push(dir_node);
-                }
-            }
-            _ => continue,
-        }
-    }
-
-    root_node.file_count = stats.total_files;
-    root_node.dir_count = root_node
-        .children
-        .iter()
-        .filter(|n| n.r#type == "directory")
-        .count();
-    root_node.size = stats.total_size;
-
-    let mut files = Vec::new();
-    match extract_files_content(query, &root_node, MAX_FILE_SIZE, rate_limit, &mut files).await {
-        Ok(_) => {}
-        Err(e) => return Err(GitIngestError::RepoNotFound(e.to_string())),
-    };
-
-    Ok(create_summary_string(query, &root_node, &files))
 }
 
 /// Represents the GitIngest extension that analyzes GitHub repositories.
@@ -716,8 +702,9 @@ impl Extension for GitIngestExtension {
                 }
 
                 let url = args.first().unwrap();
-                let mut query = Query::new(url).map_err(|e| format!("invalid repository url: {e}"))?;
-                
+                let mut query =
+                    Query::new(url).map_err(|e| format!("invalid repository url: {e}"))?;
+
                 let mut exclude_patterns = Vec::new();
                 let mut include_patterns = Vec::new();
 
@@ -734,13 +721,11 @@ impl Extension for GitIngestExtension {
                             .for_each(|s| include_patterns.push(s));
                     }
                 }
-                
+
                 query.exclude_patterns = exclude_patterns;
                 query.include_patterns = include_patterns;
 
-                let mut rate_limit = None;
-                let text = match futures::executor::block_on(process_repo(&query, &mut rate_limit))
-                {
+                let text = match futures::executor::block_on(query.process_repo()) {
                     Ok(summary) => summary,
                     Err(e) => format!("error: {e}"),
                 };
@@ -748,7 +733,7 @@ impl Extension for GitIngestExtension {
                 Ok(SlashCommandOutput {
                     sections: vec![SlashCommandOutputSection {
                         range: (0..text.len()).into(),
-                        label: "Git Repository Analysis".to_string(),
+                        label: "GitHub Repository Code".to_string(),
                     }],
                     text,
                 })
@@ -763,7 +748,6 @@ zed::register_extension!(GitIngestExtension);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[cfg(test)]
     fn create_mock_github_content(
@@ -828,90 +812,81 @@ mod tests {
     }
 
     #[test]
-    fn test_rate_limit() {
-        let rate_limit = RateLimit {
-            remaining: 0,
-            reset_time: std::time::Instant::now() + Duration::from_secs(60),
+    fn test_create_summary_string() {
+        let query = Query {
+            user_name: String::from("test_user"),
+            repo_name: String::from("test_repo"),
+            path: None,
+            branch: None,
+            ignore_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            include_patterns: Vec::new(),
         };
 
-        assert!(rate_limit.is_limited());
-        assert!(rate_limit.time_to_reset().as_secs() > 0);
+        let root_node = Node {
+            name: String::from("test_repo"),
+            r#type: String::from("directory"),
+            size: 1024,
+            children: vec![],
+            file_count: 5,
+            dir_count: 2,
+            path: String::new(),
+            ignore_content: false,
+            download_url: None,
+        };
+
+        let files = vec![FileContent {
+            path: String::from("test.txt"),
+            content: String::from("test content"),
+        }];
+
+        let summary = query.create_summary_string(&root_node, &files);
+        assert!(summary.contains("test_user/test_repo"));
+        assert!(summary.contains("Total files: 5"));
+        assert!(summary.contains("Total size: 1.00 KB"));
+        assert!(summary.contains("Directory count: 2"));
     }
 
     #[test]
-    fn test_create_summary_string() {
-            let query = Query {
-                user_name: String::from("test_user"),
-                repo_name: String::from("test_repo"),
-                path: None,
-                branch: None,
-                exclude_patterns: Vec::new(),
-                include_patterns: Vec::new(),
-            };
-
-            let root_node = Node {
-                name: String::from("test_repo"),
-                r#type: String::from("directory"),
-                size: 1024,
-                children: vec![],
-                file_count: 5,
-                dir_count: 2,
-                path: String::new(),
-                ignore_content: false,
-                download_url: None,
-            };
-
-            let files = vec![FileContent {
-                path: String::from("test.txt"),
-                content: String::from("test content"),
-            }];
-
-            let summary = create_summary_string(&query, &root_node, &files);
-            assert!(summary.contains("test_user/test_repo"));
-            assert!(summary.contains("Total files: 5"));
-            assert!(summary.contains("Total size: 1.00 KB"));
-            assert!(summary.contains("Directory count: 2"));
-        }
-
-    #[test]
     fn test_create_tree_structure() {
-            let query = Query {
-                user_name: String::from("test_user"),
-                repo_name: String::from("test_repo"),
-                path: None,
-                branch: None,
-                exclude_patterns: Vec::new(),
-                include_patterns: Vec::new(),
-            };
+        let query = Query {
+            user_name: String::from("test_user"),
+            repo_name: String::from("test_repo"),
+            path: None,
+            branch: None,
+            ignore_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            include_patterns: Vec::new(),
+        };
 
-            let child_node = Node {
-                name: String::from("child"),
-                r#type: String::from("file"),
-                size: 100,
-                children: vec![],
-                file_count: 1,
-                dir_count: 0,
-                path: String::from("child"),
-                ignore_content: false,
-                download_url: None,
-            };
+        let child_node = Node {
+            name: String::from("child"),
+            r#type: String::from("file"),
+            size: 100,
+            children: vec![],
+            file_count: 1,
+            dir_count: 0,
+            path: String::from("child"),
+            ignore_content: false,
+            download_url: None,
+        };
 
-            let root_node = Node {
-                name: String::from("root"),
-                r#type: String::from("directory"),
-                size: 100,
-                children: vec![child_node],
-                file_count: 1,
-                dir_count: 1,
-                path: String::new(),
-                ignore_content: false,
-                download_url: None,
-            };
+        let root_node = Node {
+            name: String::from("root"),
+            r#type: String::from("directory"),
+            size: 100,
+            children: vec![child_node],
+            file_count: 1,
+            dir_count: 1,
+            path: String::new(),
+            ignore_content: false,
+            download_url: None,
+        };
 
-            let tree = create_tree_structure(&query, &root_node, "", true);
-            assert!(tree.contains("└── root"));
-            assert!(tree.contains("    └── child"));
-        }
+        let tree = query.create_tree_structure(&root_node, "", true);
+        assert!(tree.contains("└── root"));
+        assert!(tree.contains("    └── child"));
+    }
 
     #[test]
     fn test_extension_run_invalid_command() {
@@ -931,11 +906,9 @@ mod tests {
 
     #[test]
     fn test_github_api_error_display() {
-        let rate_limit = GitHubApiError::RateLimit("60 seconds".to_string());
         let network = GitHubApiError::Network("connection failed".to_string());
         let other = GitHubApiError::Other("unknown error".to_string());
 
-        assert_eq!(rate_limit.to_string(), "Rate limit exceeded: 60 seconds");
         assert_eq!(network.to_string(), "Network error: connection failed");
         assert_eq!(other.to_string(), "Error: unknown error");
     }
@@ -990,11 +963,13 @@ mod tests {
             repo_name: "test-repo".to_string(),
             path: Some("src".to_string()),
             branch: Some("main".to_string()),
+            ignore_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
             include_patterns: Vec::new(),
         };
 
-        let api_url = query.api_url();
+        let path = query.path.as_deref().unwrap_or("");
+        let api_url = query.api_url(path);
         assert!(api_url.starts_with("https://api.github.com/repos/"));
         assert!(api_url.contains("test-user/test-repo"));
         assert!(api_url.contains("/src"));
@@ -1029,14 +1004,15 @@ mod tests {
             }
         }
     }
-    
+
     #[test]
     fn test_include_exclude_patterns() {
         let query = Query {
             user_name: String::from("test_user"),
             repo_name: String::from("test_repo"),
-            path: None, 
+            path: None,
             branch: None,
+            ignore_patterns: Vec::new(),
             exclude_patterns: vec!["test/*.log".to_string()],
             include_patterns: vec!["**/*.rs".to_string()],
         };
@@ -1044,10 +1020,10 @@ mod tests {
         // Mock files to test against patterns
         let mock_files = vec![
             "src/main.rs",
-            "src/lib.rs", 
+            "src/lib.rs",
             "test/output.log",
             "docs/index.html",
-            "test/test.rs"
+            "test/test.rs",
         ];
 
         // Helper functions matching those in process_repo
@@ -1055,15 +1031,17 @@ mod tests {
             if query.include_patterns.is_empty() {
                 return true;
             }
-            query.include_patterns.iter().any(|pattern| {
-                glob::Pattern::new(pattern).map_or(false, |p| p.matches(path))
-            })
+            query
+                .include_patterns
+                .iter()
+                .any(|pattern| glob::Pattern::new(pattern).map_or(false, |p| p.matches(path)))
         };
 
         let should_exclude = |path: &str| -> bool {
-            query.exclude_patterns.iter().any(|pattern| {
-                glob::Pattern::new(pattern).map_or(false, |p| p.matches(path))
-            })
+            query
+                .exclude_patterns
+                .iter()
+                .any(|pattern| glob::Pattern::new(pattern).map_or(false, |p| p.matches(path)))
         };
 
         // Test matching
@@ -1076,22 +1054,22 @@ mod tests {
                 "src/main.rs" | "src/lib.rs" => {
                     assert!(included, "Should include {}", path);
                     assert!(!excluded, "Should not exclude {}", path);
-                },
+                }
                 // Should be included (*.rs) but also excluded (test/*.log)
                 "test/output.log" => {
                     assert!(!included, "Should not include {}", path);
                     assert!(excluded, "Should exclude {}", path);
-                },
+                }
                 // Should be neither included nor excluded
                 "docs/index.html" => {
                     assert!(!included, "Should not include {}", path);
                     assert!(!excluded, "Should not exclude {}", path);
-                },
-                // Should be included (*.rs) and not excluded 
+                }
+                // Should be included (*.rs) and not excluded
                 "test/test.rs" => {
                     assert!(included, "Should include {}", path);
                     assert!(!excluded, "Should not exclude {}", path);
-                },
+                }
                 _ => panic!("Unexpected test file"),
             }
         }
@@ -1104,6 +1082,7 @@ mod tests {
             repo_name: String::from("test_repo"),
             path: None,
             branch: None,
+            ignore_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
             include_patterns: Vec::new(),
         };
@@ -1112,26 +1091,30 @@ mod tests {
             if query.include_patterns.is_empty() {
                 return true;
             }
-            query.include_patterns.iter().any(|pattern| {
-                glob::Pattern::new(pattern).map_or(false, |p| p.matches(path))
-            })
+            query
+                .include_patterns
+                .iter()
+                .any(|pattern| glob::Pattern::new(pattern).map_or(false, |p| p.matches(path)))
         };
 
         let should_exclude = |path: &str| -> bool {
-            query.exclude_patterns.iter().any(|pattern| {
-                glob::Pattern::new(pattern).map_or(false, |p| p.matches(path))
-            })
+            query
+                .exclude_patterns
+                .iter()
+                .any(|pattern| glob::Pattern::new(pattern).map_or(false, |p| p.matches(path)))
         };
 
-        let test_paths = vec![
-            "src/main.rs",
-            "test/file.txt",
-            "docs/index.html"
-        ];
+        let test_paths = vec!["src/main.rs", "test/file.txt", "docs/index.html"];
 
         for path in test_paths {
-            assert!(should_include(path), "Should include all files when include_patterns is empty");
-            assert!(!should_exclude(path), "Should exclude no files when exclude_patterns is empty");
+            assert!(
+                should_include(path),
+                "Should include all files when include_patterns is empty"
+            );
+            assert!(
+                !should_exclude(path),
+                "Should exclude no files when exclude_patterns is empty"
+            );
         }
     }
 }
