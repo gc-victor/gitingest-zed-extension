@@ -1,12 +1,11 @@
 id = "gitingest"
 name = "Git Ingest"
-description = "A powerful Zed extension that allows you to browse and analyze Git repositories via slash commands."
+description = "Turn any GitHub repository into a simple text ingest of its codebase for feeding into LLMs."
 version = "0.1.0"
 schema_version = 1
 authors = ["Víctor García"]
 repository = "https://github.com/gc-victor/gitingest"
 
 [slash_commands.gitingest]
-description = "Browse and analyze Git repositories"
+description = "Turn any GitHub repo into code text for LLMs"
 requires_argument = true
-tooltip_text = "Ask Perplexity"
