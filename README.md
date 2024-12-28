@@ -90,8 +90,9 @@ The command outputs:
 
 ## Limitations
 
-- Maximum file size: 50KB
-- Maximum total files: 500
+- Maximum total size: 1MB per repository
+- Maximum file size: 50KB per file
+- Maximum total files: 500 files per repository
 - Subject to GitHub API rate limits
 - Only supports public repositories currently
 
