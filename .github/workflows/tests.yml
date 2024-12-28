@@ -1,0 +1,33 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "**[0-9]+.[0-9]+.[0-9]+*"
+
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  unit-test:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      # selecting a toolchain either by action or manual `rustup` calls should happen
+      # before the plugin, as the cache uses the current rustc version as its cache key
+      - run: rustup toolchain install stable --profile minimal
+      - name: Rust Cache Action
+        uses: Swatinem/rust-cache@v2
+      - name: Run unit tests
+        env:
+          RUST_BACKTRACE: full
+          RUST_LOG: info
+        run: |
+          rustup update stable && rustup default stable
+          cargo test

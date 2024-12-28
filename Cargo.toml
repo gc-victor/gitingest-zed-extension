@@ -1,0 +1,18 @@
+[package]
+name = "gitingest-zed-extension"
+version = "0.1.0"
+edition = "2021"
+description = "A Zed extension to ingest Git repositories using gitingest."
+authors = ["Víctor García"]
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+data-encoding = "2.6"
+futures = { version = "0.3.31", features = ["std"] }
+glob = "0.3"
+serde = "1.0"
+serde_json = "1.0"
+zed_extension_api = "0.2"
