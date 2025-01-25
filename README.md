@@ -23,7 +23,7 @@ Follow these simple steps to set up the Git Ingest Extension in Zed Editor.
 1. **Clone the Repository**
 
     ```bash
-    git clone https://github.com/gc-victor/git-ingest-extension.git
+    git clone https://github.com/gc-victor/gitingest-zed-extension.git
     cd git-ingest-extension
     ```
 
