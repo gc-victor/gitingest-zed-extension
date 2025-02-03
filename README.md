@@ -15,8 +15,10 @@ Follow these simple steps to set up the Git Ingest Extension in Zed Editor.
 
 ### Prerequisites
 
-- **Zed Editor:** [Download and install](https://zed.dev/download).
 - **Rust:** Install via [rustup](https://rustup.rs/).
+- **Zed Editor:**
+  - [Download and install](https://zed.dev/download).
+  - [Developing Extensions](https://zed.dev/docs/extensions/developing-extensions).
 
 ### Steps
 
@@ -33,6 +35,8 @@ Follow these simple steps to set up the Git Ingest Extension in Zed Editor.
     - Go to **Extensions Manager** (`Ctrl+Shift+X`).
     - Click **Install Dev Extension**.
     - Select the `git-ingest-extension` folder you cloned.
+    - Click **Rebuild**.
+    - It can take some time to do the build. Be patient.
 
 3. **Verify Installation**
 
