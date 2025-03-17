@@ -15,4 +15,4 @@ futures = { version = "0.3.31", features = ["std"] }
 glob = "0.3"
 serde = "1.0"
 serde_json = "1.0"
-zed_extension_api = "0.2"
+zed_extension_api = "0.3"
